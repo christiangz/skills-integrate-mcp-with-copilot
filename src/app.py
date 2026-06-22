@@ -5,14 +5,56 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import RedirectResponse
+from fastapi.responses import RedirectResponse, JSONResponse
+from starlette.middleware.sessions import SessionMiddleware
+import secrets
 import os
 from pathlib import Path
+from passlib.context import CryptContext
+import json
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
+
+# --- Security: sessions and password hashing ---
+# Secret key for session cookies (set SECRET_KEY env var in production)
+secret_key = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
+app.add_middleware(SessionMiddleware, secret_key=secret_key, https_only=False)
+
+# Password hashing context (bcrypt)
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# Users file (repo root `users.json`). If missing, a default admin is created
+USERS_FILE = Path(__file__).parent.parent / "users.json"
+
+def load_users():
+    if not USERS_FILE.exists():
+        # Create default admin user if ADMIN_PASSWORD provided or fallback to 'changeme'
+        admin_password = os.environ.get("ADMIN_PASSWORD", "changeme")
+        admin = {"username": "admin", "password": pwd_context.hash(admin_password), "role": "ADMIN"}
+        USERS_FILE.write_text(json.dumps({"admin": admin}, indent=2))
+    try:
+        return json.loads(USERS_FILE.read_text())
+    except Exception:
+        return {}
+
+def verify_password(plain, hashed):
+    return pwd_context.verify(plain, hashed)
+
+def get_user(username: str):
+    users = load_users()
+    return users.get(username)
+
+def set_session_user(request: Request, username: str):
+    request.session["user"] = username
+    # create a per-session CSRF token
+    request.session["csrf_token"] = secrets.token_urlsafe(16)
+
+def clear_session(request: Request):
+    request.session.pop("user", None)
+    request.session.pop("csrf_token", None)
 
 # Mount the static files directory
 current_dir = Path(__file__).parent
@@ -89,8 +131,13 @@ def get_activities():
 
 
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(activity_name: str, email: str, request: Request):
     """Sign up a student for an activity"""
+    # Basic CSRF protection: require X-CSRF-Token header matching session
+    header_token = request.headers.get("X-CSRF-Token")
+    session_token = request.session.get("csrf_token")
+    if not session_token or not header_token or header_token != session_token:
+        raise HTTPException(status_code=403, detail="Missing or invalid CSRF token")
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -111,8 +158,17 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(activity_name: str, email: str, request: Request):
     """Unregister a student from an activity"""
+    # Require authentication: only logged-in users can unregister
+    if not request.session.get("user"):
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    # Basic CSRF protection
+    header_token = request.headers.get("X-CSRF-Token")
+    session_token = request.session.get("csrf_token")
+    if not session_token or not header_token or header_token != session_token:
+        raise HTTPException(status_code=403, detail="Missing or invalid CSRF token")
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -130,3 +186,26 @@ def unregister_from_activity(activity_name: str, email: str):
     # Remove student
     activity["participants"].remove(email)
     return {"message": f"Unregistered {email} from {activity_name}"}
+
+
+# --- Authentication endpoints ---
+@app.post("/login")
+async def login(request: Request):
+    payload = await request.json()
+    username = payload.get("username")
+    password = payload.get("password")
+    if not username or not password:
+        raise HTTPException(status_code=400, detail="username and password required")
+
+    user = get_user(username)
+    if not user or not verify_password(password, user.get("password")):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+    set_session_user(request, username)
+    return {"message": "logged in", "csrf_token": request.session.get("csrf_token")}
+
+
+@app.post("/logout")
+def logout(request: Request):
+    clear_session(request)
+    return {"message": "logged out"}
